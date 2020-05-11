@@ -1,0 +1,711 @@
+---
+title: "e&r_commdiv"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+goal is to make site by species matrices to do some double checking in the E&R analysis--this approach is to make sure that I can double check rarefaction and do more rigorous diversity using vegan, phyloseq, etc. 
+
+```{r}
+#initialization
+rm(list=ls())
+
+#setwd
+setwd("/Volumes/GoogleDrive/My Drive/microrapidevo/submission_prep/e&r_only/")
+
+#packages
+require(ggplot2)
+require(dplyr)
+require(vegan)
+require(reshape)
+require(picante)
+require(tidyverse)
+require(phyloseq)
+require(ranacapa)
+require(RColorBrewer)
+require(ggsignif)
+require(data.table)
+
+```
+
+
+first, convert the famid2.csv into site by species matrix to prep for phyloseq
+only needs to be done once
+```{r}
+rm(list=ls())
+
+#red in raw data
+rawdat<- read.table("e&r_data/remofamid2.csv", sep=",", header=TRUE)
+
+#remove low abundance (less than 100 reads) to match with previous analsysis 
+raw.clean<- filter(rawdat, totalreads > 100)
+
+#make the matrix by transposing into treatment by family i.e. site by species. keeps track of total reads
+#FUN just averages, but beacuse each treatment just has one observation, it doesn't average anything
+sitesp<- cast(raw.clean, treatment ~ family, value="totalreads", FUN=mean )
+
+#in this sitesp conversion, what are zeros are initial given NAs
+#so change NaN's to 0's
+sitesp[is.na(sitesp)] <- 0 
+
+#make data frame
+sitesp.df<- as.data.frame(sitesp)
+
+#make rownames into the first column 
+row.names(sitesp.df)<- sitesp.df$treatment
+#remove treatment as first column 
+sitesp.df[1]<- NULL
+
+#transpose for phyloseq
+sitesp.otumat<- as.data.frame(t(as.matrix(sitesp.df)))
+
+##########make sure to change the name of the file############
+#write table to import into phyloseq if need to do more fiddling
+#write.table(sitesp.otumat, file="e&r_data/burke_otumat.csv", sep=",")
+#have to rename to create "otuids" and don't know how to do this in R
+#so do it in excel and reimport
+
+```
+
+
+defining file names here. Change for each one to simplify during phyloseq import
+```{r}
+rm(list=ls())
+
+oturead<- "e&r_data/hardy_otumat.csv"
+
+taxread<- "e&r_data/hardy_tax.csv"
+
+metaread<- "e&r_data/hardy_meta.csv"
+
+```
+
+
+
+in this chunk, work way through specific analysis 
+```{r}
+#import into phyloseq
+
+#import otu matrix
+otu_table<- read.csv(oturead, sep=",", row.names=1)
+otu_table<- as.matrix(otu_table)
+OTU<- otu_table(otu_table, taxa_are_rows = TRUE)
+
+#import into phyloseq
+taxonomy<- read.csv(taxread, sep=",", row.names=1)
+taxonomy<- as.matrix(taxonomy)
+TAX<- tax_table(taxonomy)
+
+#metadata
+metadata<- read.table(metaread, sep=",", row.names = 1, header = TRUE)
+META<- sample_data(metadata)
+
+#check OTU names are consistent across objects
+taxa_names(TAX)
+taxa_names(OTU)
+
+#check sample names
+sample_names(OTU)
+sample_names(META)
+
+#import into phyloseq object
+physeq<- phyloseq(OTU, META, TAX)
+
+#double check that the everything is named correctly
+sample_names(physeq)
+sample_variables(physeq)
+tax_table(physeq)
+
+#check summary of sample data to see how to deal with treatment vs treatment.1 for rest of code
+summary(physeq@sam_data)
+
+```
+
+
+remake figures for diversity, rarefaction, etc. 
+```{r}
+#remove viridae from the taxonomy
+physeq<- physeq %>%
+  subset_taxa(Kingdom != "Virus") %>%
+
+#histogram for library size 
+df.sizes<- as.data.frame(sample_data(physeq))
+df.sizes$LibrarySize<- sample_sums(physeq)
+
+#plot histogram of library size 
+libsizeplot<-
+ggplot(data=df.sizes, aes(x=LibrarySize, fill=group)) + 
+    geom_histogram(binwidth=100000, color="white") +
+    theme_classic() + 
+    scale_fill_manual(values=c("#636363", "#66c2a5")) + 
+    scale_color_manual(values=c("#636363", "#66c2a5")) +
+    xlab("Read counts") +
+    ylab("Number of samples") + 
+    theme(legend.position="none")
+
+#ggsave(libsizeplot, file="depthhisto/hardy_full.pdf", height=3, width=4)
+
+
+#check barplots 
+#first glom by the taxonomy. then psmelt to keep sample info together
+#then calculate per individual pool (i.e. treatment.1) and calculate relabund and filter 
+physeq_fam<- physeq %>%
+    tax_glom(taxrank="Family") %>%
+    psmelt() %>%
+    group_by(treatment.1) %>%
+    mutate(total=sum(Abundance)) %>%
+    group_by(Family) %>%
+    mutate(relabund = Abundance/total) %>%
+    filter(relabund > 0.01)
+
+#palette to visualize individuals 
+famabund = length(unique(physeq_fam$Family))
+getPal = colorRampPalette(brewer.pal(8, "Set3"))
+
+#visualize relativey abundance 
+plotfam<-
+ggplot(data=physeq_fam, aes(x=Sample, y=Abundance, fill=Family)) +   
+    geom_bar(stat="identity", position="fill") + 
+    theme_classic() + 
+    theme(legend.position="right") + 
+    xlab("") + 
+    ylab("Relative abundance (> 1%)") + 
+    scale_fill_manual(values = getPal(famabund)) +
+    labs(fill="Bacteria")+ 
+    theme(legend.position="right") + 
+    guides(fill=guide_legend(ncol=2)) + 
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    labs(fill = "Family")
+
+#ggsave(plotfam, file="specabund_ind/hardy_full.tiff", height=4, width=6)
+
+#save rareplot so that the calculation doesn't have to be done again 
+rareplot<- ggrare(physeq, step=1000, color="group", label=NULL, se=TRUE, plot=TRUE) 
+
+#gussy up the plot to my own liking
+raresave<-
+  rareplot +
+  theme_classic() + 
+  scale_color_manual(values = c("#636363", "#66c2a5")) + 
+  scale_fill_manual(values = c("#636363", "#66c2a5")) +
+  xlab("Sampling depth") + 
+  ylab("Family richness") +
+  theme(legend.position = "none")
+
+#ggsave(raresave, file="rarefactioncurves/hardy_fullb.pdf", height=3, width=4)
+
+#remove wolbachia from this analysis
+nowolb<- physeq %>%
+  subset_taxa(Family != "Anaplasmataceae") %>%
+  prune_taxa(taxa_sums(.) > 0, .)
+
+nwdf.sizes<- as.data.frame(sample_data(nowolb))
+nwdf.sizes$LibrarySize<- sample_sums(nowolb)
+
+#plot histogram of library size 
+nwlibsizeplot<-
+ggplot(data=nwdf.sizes, aes(x=LibrarySize, fill=group)) + 
+    geom_histogram(binwidth=10000, color="white") +
+    theme_classic() + 
+    scale_fill_manual(values=c("#636363", "#66c2a5")) + 
+    scale_color_manual(values=c("#636363", "#66c2a5")) +
+    xlab("Read counts") +
+    ylab("Number of samples") + 
+    theme(legend.position="none")
+
+#ggsave(nwlibsizeplot, file="depthhisto/hardy_nw.pdf", height=3, width=4)
+
+
+#barplots for individuals
+nowolb_fam<- nowolb %>%
+    tax_glom(taxrank="Family") %>%
+    psmelt() %>%
+    group_by(treatment.1) %>%
+    mutate(total=sum(Abundance)) %>%
+    group_by(Family) %>%
+    mutate(relabund = Abundance/total) %>%
+    filter(relabund > 0.01)
+
+#palette to visualize individuals 
+nwfamabund = length(unique(nowolb_fam$Family))
+nwgetPal = colorRampPalette(brewer.pal(10, "Spectral"))
+
+#scramble order for better visualization, but still nice colors
+nwgetpal2<- sample(nwgetPal(nwfamabund))
+
+#visualize relativey abundance 
+plotnowolbfam<-
+ggplot(data=nowolb_fam, aes(x=Sample, y=Abundance, fill=Family)) +   
+    geom_bar(stat="identity", position="fill") + 
+    theme_classic() + 
+    theme(legend.position="right") + 
+    xlab("") + 
+    ylab("Relative abundance (> 1%)") + 
+    scale_fill_manual(values = nwgetpal2) +
+    labs(fill="Bacteria")+ 
+    theme(legend.position="right") + 
+    guides(fill=guide_legend(ncol=2)) + 
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    labs(fill = "Family")
+
+#ggsave(plotnowolbfam, file="specabund_ind/hardy_nw.tiff", height=4, width=6)
+
+
+#look at rarefaction
+rareplot.nw<-ggrare(nowolb, step=1000, color="group", label=NULL, se=TRUE, plot=TRUE)
+
+rarenw.save<-
+rareplot.nw +
+  theme_classic() + 
+  scale_color_manual(values = c("#636363", "#66c2a5")) + 
+  scale_fill_manual(values = c("#636363", "#66c2a5")) +
+  xlab("Sampling depth") + 
+  ylab("Family richness") +
+  theme(legend.position = "none")
+
+#ggsave(rarenw.save, file="rarefactioncurves/hardy_nowolbb.pdf", height=3, width=4)
+
+```
+
+calculate alpha diversity in the samples, following denef lab suggestions. 
+for the full bacterial community 
+```{r}
+#determine size to rarefy down to
+minlib<- min(sample_sums(physeq))
+
+#build df to store the trials. sampling diversity for 100 rarefactions for each sample 
+nsamp = nsamples(physeq)
+trials = 100
+
+richness <- matrix(nrow = nsamp, ncol = trials)
+row.names(richness) <- sample_names(physeq)
+
+shannon <- matrix(nrow = nsamp, ncol = trials)
+row.names(shannon) <- sample_names(physeq)
+
+fisher <- matrix(nrow = nsamp, ncol = trials)
+row.names(fisher) <- sample_names(physeq)
+
+invsimp <- matrix(nrow = nsamp, ncol = trials)
+row.names(invsimp) <- sample_names(physeq)
+
+# It is always important to set a seed when you subsample so your result is replicable 
+set.seed(3)
+
+for (i in 1:100) {
+  # Subsample
+  r <- rarefy_even_depth(physeq, sample.size = minlib, verbose = FALSE, replace = FALSE)
+  
+  # Calculate measures
+  rich <- as.numeric(as.matrix(estimate_richness(r, measures = "Observed")))
+  richness[ ,i] <- rich
+  
+  shan <- as.numeric(as.matrix(estimate_richness(r, measures = "Shannon")))
+  shannon[ ,i] <- shan
+  
+  fish<- as.numeric(as.matrix(estimate_richness(r, measures = "Fisher")))
+  fisher[ ,i] <- fish
+  
+  invs<- as.numeric(as.matrix(estimate_richness(r, measures = "InvSimpson")))
+  invsimp[ ,i] <- invs
+}
+
+#try to see if there's a weird problem with fisher only
+estimate_richness(physeq, measures = "Shannon")
+
+# Create a new dataframe to hold the means and standard deviations of richness estimates
+SampleID <- row.names(richness)
+mean <- apply(richness, 1, mean)
+sd <- apply(richness, 1, sd)
+measure <- rep("Richness", nsamp)
+rich_stats <- data.frame(SampleID, mean, sd, measure)
+
+# Create a new dataframe to hold the means and standard deviations of shannon estimates
+SampleID <- row.names(shannon)
+mean <- apply(shannon, 1, mean)
+sd <- apply(shannon, 1, sd)
+measure <- rep("Shannon", nsamp)
+shann_stats <- data.frame(SampleID, mean, sd, measure)
+
+SampleID <- row.names(fisher)
+mean <- apply(fisher, 1, mean)
+sd <- apply(fisher, 1, sd)
+measure <- rep("Fisher", nsamp)
+fish_stats <- data.frame(SampleID, mean, sd, measure)
+
+SampleID <- row.names(invsimp)
+mean <- apply(invsimp, 1, mean)
+sd <- apply(invsimp, 1, sd)
+measure <- rep("InvSimpson", nsamp)
+invs_stats <- data.frame(SampleID, mean, sd, measure)
+
+alpha <- rbind(rich_stats, shann_stats, fish_stats, invs_stats)
+
+s <- data.frame(sample_data(physeq))
+#quirk of dealing with phyloseq, but rename "treatment.1" to SampleID
+names(s)[names(s) == "treatment.1"] <- "SampleID"
+  
+alphadiv <- merge(alpha, s, by = "SampleID") 
+
+#order diversity facets
+alphadiv$measure_f<- factor(alphadiv$measure, levels=c("Shannon", "InvSimpson", "Richness", "Fisher"))
+
+#adding in variable to later facet to match individual graphs
+alphadiv$status<- "Full bacterial community"
+
+#visualize for whole community for wolbachia free experiment 
+#divplot<- 
+ggplot(alphadiv, aes(x=group, y=mean)) +
+  facet_wrap(status~measure_f, scales = "free", ncol=4) +
+  geom_boxplot() + 
+  geom_point(aes(color=group)) + 
+  scale_color_manual(values = c("#636363", "#66c2a5")) + 
+  theme_bw() + 
+  theme(panel.grid.major=element_blank(), panel.grid.minor=element_blank()) + 
+  theme(legend.position = "none") + 
+  xlab("") + 
+  ylab("Diversity measure") +
+  geom_signif(comparisons = list(c(c("control", "evolved" ))), 
+              map_signif_level = TRUE, test = "t.test") 
+
+#ggsave(divplot, file="divmeasures/hardy_totalb.pdf", height=5, width=8)
+
+
+```
+
+repeat diversity measures for wolbachia removed dataset
+```{r}
+#determine size to rarefy down to
+nwminlib<- min(sample_sums(nowolb))
+
+#build df to store the trials. sampling diversity for 100 rarefactions for each sample 
+nsamp = nsamples(nowolb)
+trials = 100
+
+nwrichness <- matrix(nrow = nsamp, ncol = trials)
+row.names(nwrichness) <- sample_names(nowolb)
+
+nwshannon <- matrix(nrow = nsamp, ncol = trials)
+row.names(nwshannon) <- sample_names(nowolb)
+
+nwfisher <- matrix(nrow = nsamp, ncol = trials)
+row.names(nwfisher) <- sample_names(nowolb)
+
+nwinvsimp <- matrix(nrow = nsamp, ncol = trials)
+row.names(nwinvsimp) <- sample_names(nowolb)
+
+# It is always important to set a seed when you subsample so your result is replicable 
+set.seed(3)
+
+for (i in 1:100) {
+  # Subsample
+  r <- rarefy_even_depth(nowolb, sample.size = nwminlib, verbose = FALSE, replace = FALSE)
+  
+  # Calculate measures
+  rich <- as.numeric(as.matrix(estimate_richness(r, measures = "Observed")))
+  nwrichness[ ,i] <- rich
+  
+  shan <- as.numeric(as.matrix(estimate_richness(r, measures = "Shannon")))
+  nwshannon[ ,i] <- shan
+  
+  fish<- as.numeric(as.matrix(estimate_richness(r, measures = "Fisher")))
+  nwfisher[ ,i] <- fish
+  
+  invs<- as.numeric(as.matrix(estimate_richness(r, measures = "InvSimpson")))
+  nwinvsimp[ ,i] <- invs
+}
+
+# Create a new dataframe to hold the means and standard deviations of richness estimates
+SampleID <- row.names(nwrichness)
+mean <- apply(nwrichness, 1, mean)
+sd <- apply(nwrichness, 1, sd)
+measure <- rep("Richness", nsamp)
+nwrich_stats <- data.frame(SampleID, mean, sd, measure)
+
+# Create a new dataframe to hold the means and standard deviations of shannon estimates
+SampleID <- row.names(nwshannon)
+mean <- apply(nwshannon, 1, mean)
+sd <- apply(nwshannon, 1, sd)
+measure <- rep("Shannon", nsamp)
+nwshann_stats <- data.frame(SampleID, mean, sd, measure)
+
+SampleID <- row.names(nwfisher)
+mean <- apply(nwfisher, 1, mean)
+sd <- apply(fisher, 1, sd)
+measure <- rep("Fisher", nsamp)
+nwfish_stats <- data.frame(SampleID, mean, sd, measure)
+
+SampleID <- row.names(nwinvsimp)
+mean <- apply(nwinvsimp, 1, mean)
+sd <- apply(nwinvsimp, 1, sd)
+measure <- rep("InvSimpson", nsamp)
+nwinvs_stats <- data.frame(SampleID, mean, sd, measure)
+
+nwalpha <- rbind(nwrich_stats, nwshann_stats, nwfish_stats, nwinvs_stats)
+
+nws <- data.frame(sample_data(nowolb))
+#quirk of dealing with phyloseq, but rename "treatment.1.1" to SampleID
+names(nws)[names(nws) == "treatment.1"] <- "SampleID"
+  
+nwalphadiv <- merge(nwalpha, nws, by = "SampleID") 
+
+#order diversity facets
+nwalphadiv$measure_f<- factor(nwalphadiv$measure, levels=c("Shannon", "InvSimpson", "Richness", "Fisher"))
+
+#adding in variable to later facet to match individual graphs
+nwalphadiv$status<- "Wolbachia removed"
+
+```
+
+
+make diversity measures figure
+```{r}
+#bind together both alphadiv and nwalphadiv
+alphatotal<- rbind(alphadiv, nwalphadiv)
+
+#plot
+#totaldivplot<-
+ggplot(alphatotal, aes(x=group, y=mean)) +
+  facet_wrap(status~measure_f, scales = "free", ncol=4) +
+  geom_boxplot() + 
+  geom_point(aes(color=group)) + 
+  scale_color_manual(values = c("#636363", "#66c2a5")) + 
+  theme_bw() + 
+  theme(panel.grid.major=element_blank(), panel.grid.minor=element_blank()) + 
+  theme(legend.position = "none") + 
+  xlab("") + 
+  ylab("Diversity measure") +
+  geom_signif(comparisons = list(c("control", "evolved")), 
+              map_signif_level = TRUE, test = "t.test")  
+
+#ggsave(totaldivplot, file="divmeasures/hardy_totalb.pdf", height=10, width=8)
+
+#write.table(alphatotal, file="e&r_data/hardy_diversity.csv", sep=",", row.names=FALSE)
+
+
+
+```
+
+
+
+to remake the main figure with this replicated sampling, need to save the withand without wolbachia. 
+and then rebuild one big dataframe to recalculate all of this 
+```{r}
+#metadata for diversity (generations of selection)
+genselect<- read.table("e&r_data/total_gentime.csv", sep=",", header=TRUE)
+
+#need to bind together all of the diversity measures, saved from above
+#read in all the files from data directory
+div.file.names<- Sys.glob("e&r_data/*_diversity.csv")
+
+#an empty dataframe to hold the data
+divset<- data.frame()
+
+#loop through and read each
+for(i in 1:length(div.file.names)) {
+  temp_data<- read.table(div.file.names[i], sep=",", header=TRUE)
+  tempdf<- data.frame(temp_data)
+  divset<- rbindlist(list(divset, tempdf))
+}
+
+#reorder factors
+divset$study_f<- factor(divset$study, levels = c('accelerated development time', 
+                                                 'delayed reproduction', 
+                                                 'increased lifespan', 'egg size',
+                                                 'desiccation resistance', 
+                                                 'fluctuating temperature',
+                                                 'salt and cadmium resistance', 
+                                                 'starvation resistance', 
+                                                 'parasitoid resistance', 'viral resistance'))
+
+#for just full bacterial communities and Shannon, 
+divset.full<- filter(divset, status =="Full bacterial community" & measure =="Shannon")
+
+#write.table(divset.full, file="divsetfull.csv", sep=",", row.names=FALSE)
+
+#plot diversity differences between control and evolved (Fig. 2)
+#plot.divfull<-
+ggplot(data=divset.full, aes(x=group, y=mean)) + 
+  geom_boxplot() + 
+  geom_point(aes(color=study_f)) +
+  facet_wrap(study_f~., scales="free", nrow=2) + 
+  scale_color_brewer(palette = "Spectral") + 
+  theme_bw() + 
+  theme(panel.grid=element_blank()) + 
+  theme(legend.position = "none") +
+  xlab("") + 
+  ylab("Bacterial diversity (family)")
+  
+#ggsave(plot.divfull, file="figs_maintext/fig2_v2.png", width=11, height=6)
+
+#calculate c diffs first
+cdiffs<- divset.full %>%
+  filter(group =="control") %>%
+  group_by(study) %>%
+  summarize(cmean = mean(mean))
+
+#addback into divdiff df
+divdiff<- divset.full %>%
+  filter(group=="evolved") %>%
+  #add back in length of selection. ignore the warning b/c it makes sense 
+  left_join(genselect, by = c("study")) %>%
+  #add back in cmean. ignore the warning b/c it makes sense
+  left_join(cdiffs, by = c("study")) %>%
+  #calculate diffs
+  mutate(deltadiv = abs(mean-cmean)) %>%
+  #log10 length of selection
+  mutate(log10.length = log10(length.selection))
+
+#plot for difference
+#plot.deltadiff<-
+ggplot(data=divdiff, aes(x=log10.length, y=deltadiv)) + 
+  geom_point(aes(color=study_f)) + 
+  scale_color_brewer(palette = "Spectral") +
+  geom_smooth(method="lm") + 
+  theme_classic() + 
+  theme(legend.title = element_blank()) + 
+  xlab("Duration of selection (log10)") + 
+  ylab("Absolute change in diversity") + 
+  theme(legend.position = "none") 
+
+#ggsave(plot.deltadiff, file="figs_maintext/fig3_v2.png", height=4, width=4)
+
+#stats check
+div.m1<- lm(data=divdiff, deltadiv ~ log10.length)
+#get p value
+summary(div.m1)
+
+#get r =0.30
+cor(divdiff$log10.length, divdiff$deltadiv)
+
+#compare with and without wolbachia plot
+#to illustrate, use 4 different studies and look at Shannon diversity
+wolb.divset<- divset %>%
+  filter(measure == "Shannon") %>%
+  filter(study == "accelerated development time" | study == "fluctuating temperature" |
+         study == "starvation resistance" | study == "viral resistance")
+
+#graph differences, faceted on +/- wolb
+#plot.wolbcomp<-
+ggplot(data=wolb.divset, aes(x=group, y=mean)) + 
+  geom_boxplot() + 
+  geom_point(aes(color=study_f)) + 
+  facet_wrap(study_f~status, nrow = 2, scales="free") + 
+  theme_bw() +
+  xlab("") + 
+  ylab("Bacterial diversity (family)") + 
+  theme(legend.position = "none") + 
+  theme(panel.grid = element_blank()) + 
+  scale_color_manual(values=c("#9e0142", "#e6f598", "#66c2a5", "#5e4fa2"))
+
+#ggsave(plot.wolbcomp, file="figs_maintext/fig4_v2.png", height=6.5, width=8.5)
+
+```
+
+
+stats for differences between control and evolved (summarized in Table 2)
+```{r}
+#convert the divset.full to data table  
+divset.dt<- as.data.table(divset.full)
+
+#t test across all treatments for the whole community 
+ttest.full<- divset.dt[, t.test(data=.SD, mean~group), by=study]
+
+#save ttest results from whole community 
+#write.table(ttest.full, file="div_ttest_full.csv", sep=",", row.names=FALSE)
+
+#filter for without wolbachia and only shannon diversity 
+divset.nw<- filter(divset, status == "Wolbachia removed" & measure == "Shannon")
+
+#convert to data table
+divset.nw.dt<- as.data.table(divset.nw)
+
+#t test across all treatments without wolbachia
+ttest.nw<- divset.nw.dt[, t.test(data=.SD, mean~group), by=study_f]
+
+#save ttest results 
+#write.table(ttest.nw, file="div_ttest_nw.csv", sep=",", row.names=FALSE)
+
+```
+
+
+
+
+
+
+specific commands uniquefor each dataset
+```{r}
+#for burke, remove selected1 because very low abundance 
+#subset_samples(treatment.1 != "selected1")
+
+#for huang, anaplasmataceae actually is all lower than 100 reads. which is weird.
+#factor adjust for this study 
+#alphadiv$broad_f<- factor(alphadiv$broad, levels = c("control", "cadmium", "salt", "spatial", "temporal" ))
+
+
+#for jha, with more than 1 group, use treatment and use broad instead of just control vs evolved
+
+
+
+#for michalak data, there's some sort of problem trying to cast it into sitesp matrix
+#Aggregation requires fun.aggregate: length used as default
+#Error in mean.default(X[[i]], ...) : 'trim' must be numeric of length one
+
+#i think its just unique to the michalak data. try another and copy into new file 
+#there was a similar problem with orozco. 
+#turns out there was duplication in the "treatment" category. I thought the "FUN=MEAN" would take care of it
+#but had to go back and redo this and seemed to fix the problem. Or cast by srrid. both worked
+
+#old way to calculate relative abundance. 
+physeq_fam2<- physeq %>%
+    tax_glom(taxrank="Family") %>%
+    transform_sample_counts(function(x) {x/sum(x)}) %>%
+    psmelt() %>%
+    filter(Abundance > 0.01) %>%
+    arrange(Family)
+
+#saving files
+
+#for wolbachia flies
+#alphatotal$study<- studyname 
+#write.table(alphatotal, file="e&r_data/burke_diversity.csv", sep=",")
+
+#remove accelerated development (outlier in length)
+divdiff.noacc<- filter(divdiff, study != "accelerated development time")
+
+ggplot(data=divdiff.noacc, aes(x=log10.length, y=deltadiv)) + 
+  geom_point(aes(color=study_f)) + 
+  scale_color_brewer(palette = "Spectral") +
+  geom_smooth(method="lm") + 
+  theme_classic() + 
+  theme(legend.title = element_blank()) + 
+  xlab("Duration of selection (log10)") + 
+  ylab("Absolute change in diversity") + 
+  theme(legend.position = "none") 
+
+div.m2<- lm(data=divdiff.noacc, deltadiv ~ length.selection+study_f )
+hist(resid(div.m2))
+shapiro.test(resid(div.m2))
+
+#just double checking that the t test by data table worked
+#filter for just one to see if it's a problem with ggsignif or the data table approach
+div.accdev<- filter(divset.nw, study =="accelerated development time")
+t.test(data=div.accdev, mean~group)
+div.accdev<- filter(divset.full, study=="accelerated development time")
+t.test(data=div.accdev, mean~group)
+
+div.egg<- filter(divset.full, study=="egg size")
+t.test(data=div.egg, mean~group)
+
+
+#testing where the degrees of freedom gets stored (i think its parameter)
+x <- rnorm(10)
+y <- rnorm(10)
+t.test(x,y)
+
+test.tt<- t.test(x,y)
+
+
+```
+
